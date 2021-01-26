@@ -64,21 +64,15 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load('ckpt/mnist_cnn.pt'))
 
     model.eval()
-    full_inference(model, test_loader)
+    full_inference(model, test_loader) # 查看全精度训练然后全精度推理时的准确率
 
     num_bits = 8
-    model.quantize(num_bits=num_bits)
+    model.quantize(num_bits=num_bits) # 将所有的模块转化为量化模块
     model.eval()
     print('Quantization bit: %d' % num_bits)
 
-    direct_quantize(model, train_loader)
+    direct_quantize(model, train_loader) # 在数据集上走一遍，收集每个activation的 min 和 max，用于后续统一使用
 
-    model.freeze()
+    model.freeze() # 固定权重
 
     quantize_inference(model, test_loader)
-
-    
-
-
-
-    
