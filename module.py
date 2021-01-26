@@ -116,9 +116,36 @@ class QConv2d(QModule):
         self.conv_module = conv_module
         self.qw = QParam(num_bits=num_bits)
 
-    def freeze(self, qi=None, qo=None):
-        
-        if hasattr(self, 'qi') and qi is not None:
+
+    def forward(self, x): # 这个 forward 函数在 post-training quant 中的功能是收集 每一层的 q_in, q_out, q_w 的 量化参数: min, max, scale, zero_point
+        """
+        对于 post_traing quant 下面的 FakeQuantize 是多余的，因为只是为了去收集量化推理时所需要的数据
+        对于 training-aware quant，下面的 FakeQuantize 是需要的
+        """
+        if hasattr(self, 'qi'):
+            self.qi.update(x) # 从 输入的 x 去更新 self.qi
+            x = FakeQuantize.apply(x, self.qi) # 根据上一步更新好的对 x 进行量化和反量化
+
+        self.qw.update(self.conv_module.weight.data) # 根据权重去更新 self.qw
+
+        x = F.conv2d(x, FakeQuantize.apply(self.conv_module.weight, self.qw), self.conv_module.bias, # 对权重进行量化和反量化后 再与 以及量化和反量化的输入进行卷积
+                     stride=self.conv_module.stride,
+                     padding=self.conv_module.padding, dilation=self.conv_module.dilation, 
+                     groups=self.conv_module.groups)
+
+        if hasattr(self, 'qo'): 
+            self.qo.update(x) #再根据 输出 去更新 self.qo 
+            x = FakeQuantize.apply(x, self.qo) # 并对输出进行量化和反量化
+
+        return x
+
+    def freeze(self, qi=None, qo=None): # 根据该层`forword`统计好的 scale 和 zero_point，去计算公式中的各项
+        """
+        计算公式中的 q_o = M * (q_i - z_i) * (q_w - z_w) 中的各项，用以推理
+        当已经在前馈过程`forward`里面获得量化所需要的参数后，就将weight进行量化，以便计算
+        """
+        if hasattr(self, 'qi') and qi is not None: # 内部已有的 self.qi 和 外部传进去的 `qi` 不能起冲突，
+                                                   # 也就是说，对于中间某些层，它的 self.qi 在实例创建时是没有的，我们是通过手动的传递上一层的 self.q_o，这样可以减少计算
             raise ValueError('qi has been provided in init function.')
         if not hasattr(self, 'qi') and qi is None:
             raise ValueError('qi is not existed, should be provided.')
@@ -132,38 +159,22 @@ class QConv2d(QModule):
             self.qi = qi
         if qo is not None:
             self.qo = qo
-        self.M = self.qw.scale * self.qi.scale / self.qo.scale
+        self.M = self.qw.scale * self.qi.scale / self.qo.scale # M 
 
-        self.conv_module.weight.data = self.qw.quantize_tensor(self.conv_module.weight.data)
-        self.conv_module.weight.data = self.conv_module.weight.data - self.qw.zero_point
-
+        self.conv_module.weight.data = self.qw.quantize_tensor(self.conv_module.weight.data) # q_w
+        self.conv_module.weight.data = self.conv_module.weight.data - self.qw.zero_point # q_w - z_w
+        
+        # 作者在计算过程中将 bias 的量化的 scale 直接置为 s_i * s_w, 然后将 zero_point 置为0
         self.conv_module.bias.data = quantize_tensor(self.conv_module.bias.data, scale=self.qi.scale * self.qw.scale,
                                                      zero_point=0, num_bits=32, signed=True)
 
-    def forward(self, x):
-        if hasattr(self, 'qi'):
-            self.qi.update(x)
-            x = FakeQuantize.apply(x, self.qi)
-
-        self.qw.update(self.conv_module.weight.data)
-
-        x = F.conv2d(x, FakeQuantize.apply(self.conv_module.weight, self.qw), self.conv_module.bias, 
-                     stride=self.conv_module.stride,
-                     padding=self.conv_module.padding, dilation=self.conv_module.dilation, 
-                     groups=self.conv_module.groups)
-
-        if hasattr(self, 'qo'):
-            self.qo.update(x)
-            x = FakeQuantize.apply(x, self.qo)
-
-        return x
 
     def quantize_inference(self, x):
         x = x - self.qi.zero_point
-        x = self.conv_module(x)
-        x = self.M * x
-        x.round_() 
-        x = x + self.qo.zero_point        
+        x = self.conv_module(x) # 定点卷积运算
+        x = self.M * x # 这一步本来是浮点数M和定点X的乘积，可以通过类似上面的 `search` 找到一个 M_0 和 n 来实现位移计算，由于pytorch这里不支持，因此采用普通的乘法
+        x.round_() # 上一步算的 x 是浮点数，需要进行取整
+        x = x + self.qo.zero_point # q_o = M * (q_x - z_x) * (q_w - z_w) + z_o  
         x.clamp_(0., 2.**self.num_bits-1.).round_()
         return x
 
@@ -175,6 +186,21 @@ class QLinear(QModule):
         self.num_bits = num_bits
         self.fc_module = fc_module
         self.qw = QParam(num_bits=num_bits)
+
+    def forward(self, x):
+        if hasattr(self, 'qi'):
+            self.qi.update(x)
+            x = FakeQuantize.apply(x, self.qi)
+
+        self.qw.update(self.fc_module.weight.data)
+
+        x = F.linear(x, FakeQuantize.apply(self.fc_module.weight, self.qw), self.fc_module.bias)
+
+        if hasattr(self, 'qo'):
+            self.qo.update(x)
+            x = FakeQuantize.apply(x, self.qo)
+
+        return x
 
     def freeze(self, qi=None, qo=None):
 
@@ -199,20 +225,6 @@ class QLinear(QModule):
         self.fc_module.bias.data = quantize_tensor(self.fc_module.bias.data, scale=self.qi.scale * self.qw.scale,
                                                    zero_point=0, num_bits=32, signed=True)
 
-    def forward(self, x):
-        if hasattr(self, 'qi'):
-            self.qi.update(x)
-            x = FakeQuantize.apply(x, self.qi)
-
-        self.qw.update(self.fc_module.weight.data)
-
-        x = F.linear(x, FakeQuantize.apply(self.fc_module.weight, self.qw), self.fc_module.bias)
-
-        if hasattr(self, 'qo'):
-            self.qo.update(x)
-            x = FakeQuantize.apply(x, self.qo)
-
-        return x
 
     def quantize_inference(self, x):
         x = x - self.qi.zero_point
@@ -225,9 +237,20 @@ class QLinear(QModule):
 
 
 class QReLU(QModule):
-
+    """
+    ReLU的量化有没明白，为啥可以直接用输入量化的结果，量化和ReLu的顺序会导致结果不一样
+    """
     def __init__(self, qi=False, num_bits=None):
         super(QReLU, self).__init__(qi=qi, num_bits=num_bits)
+
+    def forward(self, x):
+        if hasattr(self, 'qi'):
+            self.qi.update(x)
+            x = FakeQuantize.apply(x, self.qi)
+
+        x = F.relu(x)
+
+        return x
 
     def freeze(self, qi=None):
         
@@ -239,14 +262,7 @@ class QReLU(QModule):
         if qi is not None:
             self.qi = qi
 
-    def forward(self, x):
-        if hasattr(self, 'qi'):
-            self.qi.update(x)
-            x = FakeQuantize.apply(x, self.qi)
 
-        x = F.relu(x)
-
-        return x
     
     def quantize_inference(self, x):
         x = x.clone()
@@ -254,20 +270,14 @@ class QReLU(QModule):
         return x
 
 class QMaxPooling2d(QModule):
-
+    """
+    Max-Pool 的量化有没明白，为啥可以直接用输入量化的结果，量化和 MaxPool 的顺序会导致结果不一样
+    """
     def __init__(self, kernel_size=3, stride=1, padding=0, qi=False, num_bits=None):
         super(QMaxPooling2d, self).__init__(qi=qi, num_bits=num_bits)
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
-
-    def freeze(self, qi=None):
-        if hasattr(self, 'qi') and qi is not None:
-            raise ValueError('qi has been provided in init function.')
-        if not hasattr(self, 'qi') and qi is None:
-            raise ValueError('qi is not existed, should be provided.')
-        if qi is not None:
-            self.qi = qi
 
     def forward(self, x):
         if hasattr(self, 'qi'):
@@ -277,6 +287,16 @@ class QMaxPooling2d(QModule):
         x = F.max_pool2d(x, self.kernel_size, self.stride, self.padding)
 
         return x
+
+    def freeze(self, qi=None):
+        if hasattr(self, 'qi') and qi is not None:
+            raise ValueError('qi has been provided in init function.')
+        if not hasattr(self, 'qi') and qi is None:
+            raise ValueError('qi is not existed, should be provided.')
+        if qi is not None:
+            self.qi = qi
+
+
 
     def quantize_inference(self, x):
         return F.max_pool2d(x, self.kernel_size, self.stride, self.padding)
